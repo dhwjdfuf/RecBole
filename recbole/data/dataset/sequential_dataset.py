@@ -18,7 +18,7 @@ import torch
 from recbole.data.dataset import Dataset
 from recbole.data.interaction import Interaction
 from recbole.utils.enum_type import FeatureType, FeatureSource
-
+import json
 
 class SequentialDataset(Dataset):
     """:class:`SequentialDataset` is based on :class:`~recbole.data.dataset.dataset.Dataset`,
@@ -36,6 +36,8 @@ class SequentialDataset(Dataset):
         super().__init__(config)
         if config["benchmark_filename"] is not None:
             self._benchmark_presets()
+
+        json.dump(self.field2token_id, open('map.json','w'))
 
     def _change_feat_format(self):
         """Change feat format from :class:`pandas.DataFrame` to :class:`Interaction`,
