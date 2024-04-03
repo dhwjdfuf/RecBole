@@ -21,7 +21,9 @@ from torch import nn
 from recbole.model.abstract_recommender import SequentialRecommender
 from recbole.model.layers import TransformerEncoder
 from recbole.model.loss import BPRLoss
-
+import pandas as pd
+import numpy as np
+import json
 
 class SASRec(SequentialRecommender):
     r"""
@@ -51,10 +53,25 @@ class SASRec(SequentialRecommender):
         self.initializer_range = config["initializer_range"]
         self.loss_type = config["loss_type"]
 
-        # define layers and loss
-        self.item_embedding = nn.Embedding(
-            self.n_items, self.hidden_size, padding_idx=0
+
+        self.item_embedding = nn.Embedding( 
+            self.n_items, self.hidden_size, padding_idx=0 
         )
+        
+        self.token_map = json.load(open('map.json', 'r')) # 이걸로 해야할 일은, ['user_id', 'item_id']
+        self.df= pd.read_csv('/home/jamesoh0813/ryeol/RecBole/dataset/shorts/ryeol_filby.csv')
+        self.df['userID'] = self.df['userID'].apply(lambda x: self.token_map['user_id'][str(x)]) 
+        self.df['itemID'] = self.df['itemID'].apply(lambda x: self.token_map['item_id'][str(x)]) # 이거다. user도 할 수 있으면 좋음. 
+
+        self.itemID = self.df['itemID'].to_numpy()
+
+
+
+
+        #self.negative_pos_emb = torch.nn.Embedding(100, self.hidden_size) # enhancing L_p
+        self.negative_pos_emb = torch.nn.Embedding(100, 1) # enhancing L_p
+
+
         self.position_embedding = nn.Embedding(self.max_seq_length, self.hidden_size)
         self.trm_encoder = TransformerEncoder(
             n_layers=self.n_layers,
@@ -113,11 +130,13 @@ class SASRec(SequentialRecommender):
         output = self.gather_indexes(output, item_seq_len - 1)
         return output  # [B H]
 
-    def calculate_loss(self, interaction):
-        item_seq = interaction[self.ITEM_SEQ]
-        item_seq_len = interaction[self.ITEM_SEQ_LEN]
-        seq_output = self.forward(item_seq, item_seq_len)
-        pos_items = interaction[self.POS_ITEM_ID]
+    def calculate_loss(self, interaction): # loss 여기. 
+        item_seq = interaction[self.ITEM_SEQ] # (1024, 200)
+        item_seq_len = interaction[self.ITEM_SEQ_LEN] # (1024, ) . valid len만 모아둔 것. 
+        seq_output = self.forward(item_seq, item_seq_len) # (1024, 64). 아 이거 sliding window 방식이 아니고, 마지막의 embedding만 뽑아오는 꼴. 
+        pos_items = interaction[self.POS_ITEM_ID] #(1024, )
+
+
         if self.loss_type == "BPR":
             neg_items = interaction[self.NEG_ITEM_ID]
             pos_items_emb = self.item_embedding(pos_items)
@@ -126,10 +145,70 @@ class SASRec(SequentialRecommender):
             neg_score = torch.sum(seq_output * neg_items_emb, dim=-1)  # [B]
             loss = self.loss_fct(pos_score, neg_score)
             return loss
-        else:  # self.loss_type = 'CE'
-            test_item_emb = self.item_embedding.weight
-            logits = torch.matmul(seq_output, test_item_emb.transpose(0, 1))
+        else:  # self.loss_type = 'CE' . 여기임. 여기서 contrastive loss를 return해야됨. 
+            test_item_emb = self.item_embedding.weight # (M, 64)
+            logits = torch.matmul(seq_output, test_item_emb.transpose(0, 1)) #(1024, M)
             loss = self.loss_fct(logits, pos_items)
+
+            # user_id, torch.Size([1024]), cuda, torch.int64 
+            # item_id, torch.Size([1024]), cuda, torch.int64
+            # timestamp, torch.Size([1024]), cuda, torch.float32
+            # item_length, torch.Size([1024]), cuda, torch.int64
+
+            # item_id_list, torch.Size([1024, 200]), cuda, torch.int64  input session
+            # timestamp_list, torch.Size([1024, 200]), cuda, torch.float32  
+
+
+            #----------------------------------------------Lp----------------------------------------------------begin
+            batch_size, _ = item_seq.shape
+            SASs = seq_output # SASs : (1024, 64) 
+            GT_embs = self.item_embedding(pos_items) # (1024, 64)
+            dev = item_seq.device
+            item_seq_cpu = item_seq.cpu().numpy() # (1024, 200)
+            
+
+            timestamp = interaction['timestamp_list'].cpu().numpy().astype(int)  #(1024, 200)
+            negF = np.zeros((batch_size, 100), dtype= int) # 이거 hyperparameter tuning은 해야해. 
+
+            item_seq_len_cpu = item_seq_len.cpu().numpy() # 
+
+            start_indices = timestamp[:,0] + 1 # (1024, )
+            end_indices = timestamp[np.arange(batch_size),item_seq_len_cpu-1] # (1024, ) 
+
+            for i in range(batch_size): 
+                line = self.itemID[start_indices[i]:end_indices[i]]  
+                to_delete = item_seq_cpu[i]
+                filtered_line = line[np.in1d(line, to_delete, invert=True)]
+                valid_len = min(100, len(filtered_line))
+                if valid_len == 0 : continue
+                negF[i][-valid_len:] = filtered_line[-valid_len:]
+
+
+            negF=torch.from_numpy(negF)
+
+            # SASs : (1024, 64)
+            negFembs = self.item_embedding(negF.to(dev)).to(dev) # (1024, 100, 64)   이건 어차피 right pushed. right pushed는 상관 없다. 
+
+            
+            sim = torch.nn.CosineSimilarity(dim=-1, eps=1e-6) 
+            numerator = torch.exp(sim(SASs, GT_embs) * 2 )  # (1024, ) 
+            
+            repeatedSASs = SASs.unsqueeze(1).repeat(1,100,1) # (1024,100,64)
+
+            denom_sim = torch.exp(sim(repeatedSASs,negFembs)  * 2) # (1024, 100)   
+            
+            denominator = torch.sum(denom_sim, dim=-1) 
+            Lp_loss = -torch.log( numerator / denominator) # (1024 ,)
+
+            Lp = torch.mean(Lp_loss)
+
+            # print(loss) #10.71
+            # print(Lp) #4.6
+
+            loss += Lp * 0.1
+            #----------------------------------------------Lp----------------------------------------------------end
+            
+            
             return loss
 
     def predict(self, interaction):
