@@ -59,7 +59,7 @@ class SASRec(SequentialRecommender):
         )
         
         self.token_map = json.load(open('map.json', 'r')) # 이걸로 해야할 일은, ['user_id', 'item_id']
-        self.df= pd.read_csv('/home/jamesoh0813/ryeol/RecBole/dataset/shorts/ryeol_filby.csv')
+        self.df= pd.read_csv('dataset/shorts/ryeol_filby.csv')
         self.df['userID'] = self.df['userID'].apply(lambda x: self.token_map['user_id'][str(x)]) 
         self.df['itemID'] = self.df['itemID'].apply(lambda x: self.token_map['item_id'][str(x)]) # 이거다. user도 할 수 있으면 좋음. 
 
